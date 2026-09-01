@@ -134,6 +134,15 @@ app.get('/auth/ml/callback', async (req, res) => {
   }
 });
 
+// Recebe as notificações (webhook) que o Mercado Livre envia quando um
+// pedido/item muda — hoje só confirma o recebimento (200 OK). Se o RUFUS
+// parar de responder rápido aqui, o ML desativa as notificações do app
+// depois de várias falhas seguidas.
+app.post('/webhooks/ml', (req, res) => {
+  console.log('Notificação do Mercado Livre:', JSON.stringify(req.body));
+  res.sendStatus(200);
+});
+
 // Vendas recentes com a comissão real cobrada em cada uma (order.payments[].marketplace_fee)
 app.get('/api/ml/vendas', checarSenha, async (req, res) => {
   try {
