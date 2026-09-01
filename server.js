@@ -101,17 +101,25 @@ async function getAccessTokenML() {
   return tokens.access_token;
 }
 
-// PKCE: o Mercado Livre passou a exigir esse par (code_verifier/code_challenge)
-// além do client_id/secret. Guardado em memória porque é um fluxo de um único
-// dono de conta feito manualmente pelo navegador — login e callback acontecem
-// segundos depois um do outro, no mesmo processo. Se o servidor reiniciar
-// entre os dois passos (ex: acordando do plano free do Render), refaça o
-// /auth/ml/login do zero.
-let mlCodeVerifier = null;
+// PKCE: o Mercado Livre exige esse par (code_verifier/code_challenge) além do
+// client_id/secret. Guardado no Supabase (não em memória) porque o Render
+// (plano free) hiberna o servidor entre o /login e o /callback, e a memória
+// se perde nesse meio-tempo — foi exatamente isso que causou "sessão expirou"
+// na primeira versão desse código.
+async function salvarPkce(codeVerifier) {
+  const { error } = await supabase.from('ml_pkce').upsert({ id: 1, code_verifier: codeVerifier });
+  if (error) throw error;
+}
+async function lerPkce() {
+  const { data, error } = await supabase.from('ml_pkce').select('code_verifier').eq('id', 1).maybeSingle();
+  if (error) throw error;
+  return data?.code_verifier || null;
+}
 
-app.get('/auth/ml/login', (req, res) => {
-  mlCodeVerifier = crypto.randomBytes(48).toString('base64url');
-  const codeChallenge = crypto.createHash('sha256').update(mlCodeVerifier).digest('base64url');
+app.get('/auth/ml/login', async (req, res) => {
+  const codeVerifier = crypto.randomBytes(48).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  await salvarPkce(codeVerifier);
 
   const url = new URL(ML_AUTH_URL);
   url.searchParams.set('response_type', 'code');
@@ -126,7 +134,8 @@ app.get('/auth/ml/login', (req, res) => {
 app.get('/auth/ml/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Faltou o parâmetro "code".');
-  if (!mlCodeVerifier) return res.status(400).send('Sessão de login expirou (servidor reiniciou) — acesse /auth/ml/login de novo.');
+  const codeVerifier = await lerPkce();
+  if (!codeVerifier) return res.status(400).send('Sessão de login expirou — acesse /auth/ml/login de novo.');
   try {
     const resp = await fetch(ML_TOKEN_URL, {
       method: 'POST',
@@ -137,12 +146,18 @@ app.get('/auth/ml/callback', async (req, res) => {
         client_secret: ML_CLIENT_SECRET,
         code,
         redirect_uri: ML_REDIRECT_URI,
-        code_verifier: mlCodeVerifier,
+        code_verifier: codeVerifier,
       }),
     });
     const tokens = await resp.json();
     if (!resp.ok) throw new Error(JSON.stringify(tokens));
-    mlCodeVerifier = null;
+    if (!tokens.refresh_token) {
+      throw new Error(
+        'O Mercado Livre não devolveu refresh_token. No DevCenter, edite o app e confirme que o escopo ' +
+        '"offline_access" está habilitado nas permissões dele (não só na URL de autorização) — sem isso ' +
+        'o token dura poucas horas e não dá pra renovar sozinho.'
+      );
+    }
     await salvarTokenML(tokens, tokens.user_id);
     res.send('Conta do Mercado Livre conectada com sucesso. Pode fechar esta aba.');
   } catch (e) {
@@ -160,7 +175,9 @@ app.post('/webhooks/ml', (req, res) => {
   res.sendStatus(200);
 });
 
-// Vendas recentes com a comissão real cobrada em cada uma (order.payments[].marketplace_fee)
+// Vendas recentes com a comissão real cobrada em cada uma. A taxa fica em
+// order_items[].sale_fee (valor por unidade) — payments[].marketplace_fee
+// costuma vir zerado, então não é essa a fonte certa.
 app.get('/api/ml/vendas', checarSenha, async (req, res) => {
   try {
     const accessToken = await getAccessTokenML();
@@ -179,14 +196,15 @@ app.get('/api/ml/vendas', checarSenha, async (req, res) => {
           headers: { Authorization: `Bearer ${accessToken}` },
         });
         const detalhe = await detalheResp.json();
-        const pagamento = (detalhe.payments || [])[0] || {};
+        const itens = detalhe.order_items || [];
+        const comissaoTotal = itens.reduce((soma, item) => soma + (item.sale_fee || 0) * (item.quantity || 1), 0);
         return {
           pedido_id: detalhe.id,
           data: detalhe.date_created,
-          produto: (detalhe.order_items || [])[0]?.item?.title,
+          produto: itens[0]?.item?.title,
           valor_total: detalhe.total_amount,
-          comissao_ml: pagamento.marketplace_fee ?? null,
-          valor_liquido: pagamento.marketplace_fee != null ? detalhe.total_amount - pagamento.marketplace_fee : null,
+          comissao_ml: comissaoTotal,
+          valor_liquido: detalhe.total_amount - comissaoTotal,
         };
       })
     );
