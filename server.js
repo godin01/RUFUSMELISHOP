@@ -101,17 +101,31 @@ async function getAccessTokenML() {
   return tokens.access_token;
 }
 
+// PKCE: o Mercado Livre passou a exigir esse par (code_verifier/code_challenge)
+// além do client_id/secret. Guardado em memória porque é um fluxo de um único
+// dono de conta feito manualmente pelo navegador — login e callback acontecem
+// segundos depois um do outro, no mesmo processo. Se o servidor reiniciar
+// entre os dois passos (ex: acordando do plano free do Render), refaça o
+// /auth/ml/login do zero.
+let mlCodeVerifier = null;
+
 app.get('/auth/ml/login', (req, res) => {
+  mlCodeVerifier = crypto.randomBytes(48).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(mlCodeVerifier).digest('base64url');
+
   const url = new URL(ML_AUTH_URL);
   url.searchParams.set('response_type', 'code');
   url.searchParams.set('client_id', ML_CLIENT_ID);
   url.searchParams.set('redirect_uri', ML_REDIRECT_URI);
+  url.searchParams.set('code_challenge', codeChallenge);
+  url.searchParams.set('code_challenge_method', 'S256');
   res.redirect(url.toString());
 });
 
 app.get('/auth/ml/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Faltou o parâmetro "code".');
+  if (!mlCodeVerifier) return res.status(400).send('Sessão de login expirou (servidor reiniciou) — acesse /auth/ml/login de novo.');
   try {
     const resp = await fetch(ML_TOKEN_URL, {
       method: 'POST',
@@ -122,10 +136,12 @@ app.get('/auth/ml/callback', async (req, res) => {
         client_secret: ML_CLIENT_SECRET,
         code,
         redirect_uri: ML_REDIRECT_URI,
+        code_verifier: mlCodeVerifier,
       }),
     });
     const tokens = await resp.json();
     if (!resp.ok) throw new Error(JSON.stringify(tokens));
+    mlCodeVerifier = null;
     await salvarTokenML(tokens, tokens.user_id);
     res.send('Conta do Mercado Livre conectada com sucesso. Pode fechar esta aba.');
   } catch (e) {
