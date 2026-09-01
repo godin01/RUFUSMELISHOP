@@ -119,6 +119,7 @@ app.get('/auth/ml/login', (req, res) => {
   url.searchParams.set('redirect_uri', ML_REDIRECT_URI);
   url.searchParams.set('code_challenge', codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
+  url.searchParams.set('scope', 'offline_access read'); // sem offline_access o ML não devolve refresh_token
   res.redirect(url.toString());
 });
 
